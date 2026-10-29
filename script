@@ -1,0 +1,621 @@
+"""
+Painel de temperatura com cenário animado (sem termômetro).
+
+Quanto mais frio: céu azul-gelo, neve caindo, geada nas bordas, montanhas nevadas.
+Quanto mais quente: céu laranja, sol crescendo, brasas subindo, ar tremendo.
+No meio: céu calmo, folhas levadas pelo vento.
+
+Instalar:  py -m pip install flask requests
+Rodar:     py main.py
+Abrir:     http://localhost:5000
+"""
+import math
+import random
+import re
+import time
+
+import requests
+from flask import Flask, Response, jsonify
+
+# ---------------- Configuração ----------------
+URL_SENSOR = "http://10.246.152.235/temperaturec"
+SENSOR_LIGADO = False      # True quando o sensor real estiver conectado
+LIMITE_MIN = 2.0           # abaixo disso: alerta de frio
+LIMITE_MAX = 30.0          # acima disso: alerta de calor
+FRIO_COMECA = 12.0         # a partir daqui o cenário começa a esfriar
+CALOR_COMECA = 24.0        # a partir daqui o cenário começa a esquentar
+SIMULAR_SE_OFFLINE = True  # gera valores falsos se o sensor não responder
+# ----------------------------------------------
+
+app = Flask(__name__)
+inicio = time.time()
+demo = {"modo": None}
+ultimo = {"v": 18.0}
+ALVOS_DEMO = {"quente": 40.0, "frio": -6.0}
+
+
+def ler_sensor():
+    resp = requests.get(URL_SENSOR, timeout=1)
+    resp.raise_for_status()
+    match = re.search(r"-?\d+(?:[.,]\d+)?", resp.text)
+    if not match:
+        raise ValueError(f"Resposta sem número: {resp.text!r}")
+    return float(match.group().replace(",", "."))
+
+
+def valor_simulado():
+    if demo["modo"] in ALVOS_DEMO:
+        alvo = ALVOS_DEMO[demo["modo"]]
+        v = ultimo["v"] + (alvo - ultimo["v"]) * 0.15
+    else:
+        base = 18 + 6 * math.sin((time.time() - inicio) / 20)
+        v = ultimo["v"] + (base - ultimo["v"]) * 0.25
+    v += random.uniform(-0.3, 0.3)
+    ultimo["v"] = v
+    return round(v, 2)
+
+
+@app.route("/api/temp")
+def api_temp():
+    simulado = True
+    if demo["modo"]:
+        temp = valor_simulado()
+    elif not SENSOR_LIGADO:
+        temp = valor_simulado()
+    else:
+        try:
+            temp = ler_sensor()
+            ultimo["v"] = temp
+            simulado = False
+        except Exception as e:
+            if not SIMULAR_SE_OFFLINE:
+                return jsonify(ok=False, erro=str(e)), 502
+            temp = valor_simulado()
+    return jsonify(ok=True, temp=temp, simulado=simulado, demo=demo["modo"],
+                   min=LIMITE_MIN, max=LIMITE_MAX,
+                   frio=FRIO_COMECA, calor=CALOR_COMECA,
+                   hora=time.strftime("%H:%M:%S"))
+
+
+@app.route("/api/demo/<modo>", methods=["POST"])
+def api_demo(modo):
+    demo["modo"] = modo if modo in ALVOS_DEMO else None
+    return jsonify(ok=True, modo=demo["modo"])
+
+
+@app.route("/")
+def index():
+    return Response(PAGINA, mimetype="text/html")
+
+
+PAGINA = r"""<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clima do ambiente</title>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@600;700&family=Barlow:wght@500;600&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#0d1b2a;font-family:Barlow,system-ui,sans-serif;color:#fff}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #cena{filter:url(#tremor)}
+  .hud{position:fixed;left:50%;top:9vh;transform:translateX(-50%);text-align:center;z-index:3;
+       text-shadow:0 4px 30px rgba(0,0,0,.45);pointer-events:none}
+  .valor{font-family:"Chakra Petch",sans-serif;font-size:clamp(4.5rem,15vw,10rem);line-height:1;font-weight:700;
+         transition:color 1.5s}
+  .valor small{font-size:.35em;opacity:.8}
+  #estado{margin-top:10px;font-size:clamp(1.1rem,3vw,1.6rem);font-weight:600;min-height:1.4em}
+  #estado.troca{animation:troca .6s ease}
+  @keyframes troca{from{opacity:0;transform:translateY(12px)}}
+  .info{margin-top:6px;opacity:.75;font-size:.95rem}
+  .alerta .valor{animation:pulsa 1.2s ease-in-out infinite}
+  @keyframes pulsa{50%{transform:scale(1.05)}}
+  .demo{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:4;display:flex;gap:6px;padding:7px;
+        background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.2);border-radius:999px;backdrop-filter:blur(10px)}
+  .btn{border:0;border-radius:999px;padding:11px 18px;min-height:44px;font:600 .95rem Barlow,sans-serif;color:#fff;
+       background:transparent;cursor:pointer;transition:background .3s}
+  .btn:hover{background:rgba(255,255,255,.12)}
+  .btn:focus-visible{outline:2px solid #fff;outline-offset:2px}
+  .reviver{position:fixed;left:50%;top:calc(9vh + 13rem);transform:translateX(-50%);z-index:4;background:#fff;color:#0d1b2a}
+  .reviver:hover{background:#dcefff}
+  #frente{z-index:2;touch-action:none}
+  .btn.ativo{background:#fff;color:#0d1b2a}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute">
+  <filter id="tremor">
+    <feTurbulence id="turb" type="fractalNoise" baseFrequency="0.01 0.04" numOctaves="2" seed="3"/>
+    <feDisplacementMap id="desloc" in="SourceGraphic" scale="0"/>
+  </filter>
+</svg>
+<canvas id="cena"></canvas>
+<canvas id="frente"></canvas>
+
+<div class="hud">
+  <div class="valor"><span id="num">--</span><small>°C</small></div>
+  <div id="estado">Conectando ao sensor…</div>
+  <div class="info" id="info"></div>
+</div>
+
+<button class="btn reviver" id="reviver" hidden>😇 Reviver</button>
+<nav class="demo" aria-label="Modo demonstração">
+  <button class="btn" data-modo="frio">❄️ Esfriar</button>
+  <button class="btn ativo" data-modo="normal">Sensor real</button>
+  <button class="btn" data-modo="quente">🔥 Esquentar</button>
+</nav>
+
+<script>
+// navegador antigo sem roundRect: desenha retângulo arredondado na mão
+if (!CanvasRenderingContext2D.prototype.roundRect) {
+  CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, r) {
+    r = Math.min(Math.abs(r), Math.abs(w) / 2, Math.abs(h) / 2);
+    this.moveTo(x + r, y); this.arcTo(x + w, y, x + w, y + h, r); this.arcTo(x + w, y + h, x, y + h, r);
+    this.arcTo(x, y + h, x, y, r); this.arcTo(x, y, x + w, y, r); this.closePath(); return this;
+  };
+}
+const $ = s => document.querySelector(s);
+const cena = $("#cena"), cx = cena.getContext("2d");
+const frente = $("#frente"), fx = frente.getContext("2d");
+let W, H;
+function redimensionar(){ W = cena.width = frente.width = innerWidth; H = cena.height = frente.height = innerHeight; }
+redimensionar(); addEventListener("resize", redimensionar);
+
+/* ---------- lógica: temperatura -> intensidade de frio e de calor (0..1) ---------- */
+let cfg = { min: 2, max: 30, frio: 12, calor: 24 };
+let alvoFrio = 0, alvoCalor = 0;   // destino vindo do sensor
+let frio = 0, calor = 0;           // valor suavizado que a animação usa
+let tempAlvo = null, tempVista = null;
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const mix = (a, b, t) => a + (b - a) * t;
+function intensidades(t){
+  // frio: 0 em FRIO_COMECA, 1 quando passa 6° abaixo do limite mínimo
+  const f = clamp((cfg.frio - t) / (cfg.frio - (cfg.min - 6)));
+  // calor: 0 em CALOR_COMECA, 1 quando passa 8° acima do limite máximo
+  const q = clamp((t - cfg.calor) / ((cfg.max + 8) - cfg.calor));
+  return [f, q];
+}
+
+/* ---------- paletas do céu ---------- */
+const CEU = {
+  frio:   [[18,40,74],[120,170,215],[225,240,255]],
+  normal: [[22,60,110],[70,140,190],[150,210,200]],
+  quente: [[90,20,30],[220,90,40],[255,190,90]]
+};
+function corCeu(i){
+  const n = CEU.normal[i], f = CEU.frio[i], q = CEU.quente[i];
+  return n.map((v, k) => Math.round(mix(mix(v, f[k], frio), q[k], calor)));
+}
+const rgb = (c, a = 1) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+
+/* ---------- partículas ---------- */
+const neve = [], brasas = [], folhas = [];
+const r = Math.random;
+function novaNeve(topo){ return { x: r() * W, y: topo ? -10 : r() * H, v: .6 + r() * 1.8, t: 1 + r() * 3.5, f: r() * 6.3 }; }
+function novaBrasa(base){ return { x: r() * W, y: base ? H + 10 : r() * H, v: .8 + r() * 2.5, t: 1 + r() * 2.5, f: r() * 6.3 }; }
+function novaFolha(){ return { x: -20, y: r() * H * .8, v: 1 + r() * 2, f: r() * 6.3, g: r() * 6.3 }; }
+for (let i = 0; i < 260; i++) neve.push(novaNeve(false));
+for (let i = 0; i < 160; i++) brasas.push(novaBrasa(false));
+for (let i = 0; i < 14; i++) { const f = novaFolha(); f.x = r() * W; folhas.push(f); }
+
+/* montanhas fixas (perfil gerado uma vez) */
+const serra = [...Array(40)].map((_, i) => .55 + .18 * Math.sin(i * .7) + .08 * Math.sin(i * 2.3) + r() * .03);
+
+/* ---------- personagem: reage ao frio e ao calor ---------- */
+const fumacas = [], gotas = [];
+const ITENS = ["gorro", "cachecol", "casaco"];
+const itens = {};                 // on = vestido; solto = caído/arrastado pela tela
+function vestirTudo(){ ITENS.forEach(k => itens[k] = { on: true, solto: null }); }
+vestirTudo();
+const morte = { exposto: 0, aquecendo: 0, inicio: null, tipo: null };   // segundos pelado no frio / no calor extremo
+const caixas = {};                // área clicável de cada item, em coordenadas da tela
+let boneco = { x: 0, y: 0, s: 1 };
+const COR_CASACO = () => rgb([Math.round(mix(240, 60, Math.max(frio, .6))), Math.round(mix(200, 110, Math.max(frio, .6))), Math.round(mix(90, 200, Math.max(frio, .6)))]);
+
+function desenharGorro(c){
+  c.fillStyle = "#e63946"; c.beginPath(); c.arc(0, 4, 31, Math.PI, 0); c.fill();
+  c.fillStyle = "#fff"; c.beginPath(); c.roundRect(-33, 0, 66, 10, 5); c.fill();
+  c.beginPath(); c.arc(0, -30, 8, 0, 7); c.fill();
+}
+function desenharCachecol(c, agora){
+  c.fillStyle = "#e63946";
+  c.beginPath(); c.roundRect(-28, -6, 56, 12, 6); c.fill();
+  c.beginPath(); c.roundRect(8, -2, 12, 34 + Math.sin(agora / 200) * 3, 5); c.fill();
+}
+function desenharCasaco(c, larg){
+  c.fillStyle = COR_CASACO();
+  c.beginPath(); c.roundRect(-larg, -72, larg * 2, 72, 18); c.fill();
+  c.strokeStyle = "rgba(0,0,0,.25)"; c.lineWidth = 3;
+  c.beginPath(); c.moveTo(0, -66); c.lineTo(0, -4); c.stroke();
+  c.fillStyle = "rgba(0,0,0,.3)"; [-50, -34, -18].forEach(y => { c.beginPath(); c.arc(-6, y, 2.5, 0, 7); c.fill(); });
+}
+
+function personagem(agora){
+  const s = Math.min(W, H) / 520;
+  const x0 = W * .28, chao = H * .9;
+  const vestido = ITENS.filter(k => itens[k].on).length;
+  const nu = 1 - vestido / ITENS.length;          // 0 vestido, 1 sem nada
+  const sente = clamp(frio * (.4 + nu));          // frio que ele SENTE
+
+  // lógica da morte: sem roupa nenhuma num frio forte por 3 s
+  if (!morte.inicio) {
+    if (vestido === 0 && frio > .5) morte.exposto += 1 / 60; else morte.exposto = Math.max(0, morte.exposto - 2 / 60);
+    if (calor > .8) morte.aquecendo += 1 / 60; else morte.aquecendo = Math.max(0, morte.aquecendo - 2 / 60);
+    if (morte.exposto > 3) { morte.inicio = agora; morte.tipo = "frio"; anunciarMorte(); }
+    else if (morte.aquecendo > 5) { morte.inicio = agora; morte.tipo = "calor"; anunciarMorte(); }
+  }
+  const derretendo = clamp(morte.aquecendo / 5);   // 0..1 antes de derreter de vez
+  const pm = morte.inicio ? clamp((agora - morte.inicio) / (morte.tipo === "calor" ? 3000 : 1500)) : 0;   // progresso da queda
+  const morto = !!morte.inicio;
+  const congelando = clamp(morte.exposto / 3);
+
+  const treme = !morto && sente > .3 ? Math.sin(agora / 25) * (3 + congelando * 6) * sente : 0;
+  const respira = morto ? 0 : Math.sin(agora / 600) * 2;
+  const murcha = morto ? 0 : calor * 10;
+  boneco = { x: x0 + treme, y: chao, s };
+
+  fx.save(); fx.translate(x0 + treme, chao); fx.scale(s, s);
+  fx.fillStyle = `rgba(0,0,0,${.18 + calor * .15})`;
+  fx.beginPath(); fx.ellipse(morto ? -60 * pm : 0, 0, 50 + calor * 15 + pm * 50, 9, 0, 0, 7); fx.fill();
+
+  const ease = 1 - Math.pow(1 - pm, 3);
+  const derreteu = morto && morte.tipo === "calor";
+  // poça de "boneco derretido" se espalhando no chão
+  const poca = derreteu ? ease : derretendo * .3;
+  if (poca > 0) {
+    fx.fillStyle = `rgba(255,150,110,${.5 + poca * .4})`;
+    fx.beginPath(); fx.ellipse(0, -2, 40 + poca * 110, 6 + poca * 12, 0, 0, 7); fx.fill();
+    fx.fillStyle = "rgba(255,255,255,.35)";
+    fx.beginPath(); fx.ellipse(-20 - poca * 30, -6, 12 + poca * 20, 3, 0, 0, 7); fx.fill();
+  }
+  if (derreteu) {
+    fx.scale(1 + ease * .7, Math.max(.04, 1 - ease * .97));                 // escorre até virar poça
+  } else if (derretendo > 0 && !morto) {
+    const bambo = Math.sin(agora / 300) * .03 * derretendo;
+    fx.scale(1 + derretendo * .15 + bambo, 1 - derretendo * .25 - bambo);  // amolecendo
+  }
+  if (morto && morte.tipo === "frio") { fx.translate(-20 * ease, 0); fx.rotate(-Math.PI / 2 * ease); }   // tomba congelado
+
+  fx.strokeStyle = "#2b3a55"; fx.lineWidth = 12; fx.lineCap = "round";
+  const pe = sente > .5 ? 8 : 18;
+  fx.beginPath(); fx.moveTo(-10, -60); fx.lineTo(-pe, -4); fx.moveTo(10, -60); fx.lineTo(pe, -4); fx.stroke();
+
+  const yCorpo = -60 + murcha * .3;
+  const larg = itens.casaco.on ? mix(30, 42, frio) : 30;
+  const pele = derreteu || derretendo > .2
+    ? rgb([255, Math.round(mix(160, 110, Math.max(derretendo, ease))), Math.round(mix(140, 90, Math.max(derretendo, ease)))])
+    : (morto && morte.tipo === "frio") || congelando > .3
+    ? rgb([Math.round(mix(225, 150, Math.max(congelando, ease))), Math.round(mix(220, 200, congelando)), 245])
+    : rgb([Math.round(mix(mix(250, 225, sente), 255, calor)), Math.round(mix(mix(210, 220, sente), 160, calor)), Math.round(mix(mix(175, 235, sente), 140, calor))]);
+
+  // corpo: casaco (se vestido) ou camiseta
+  const mostraCasaco = itens.casaco.on && frio > .2;
+  if (mostraCasaco) { fx.save(); fx.translate(0, yCorpo + respira); fx.globalAlpha = clamp((frio - .2) * 3); desenharCasaco(fx, larg); fx.restore(); }
+  if (!mostraCasaco || frio < .53) {
+    fx.save(); if (mostraCasaco) fx.globalAlpha = 1 - clamp((frio - .2) * 3);
+    fx.fillStyle = calor > frio ? rgb([255, Math.round(mix(200, 140, calor)), Math.round(mix(90, 60, calor))]) : "#f1f1f1";
+    fx.beginPath(); fx.roundRect(-30, yCorpo - 70 + respira, 60, 72, 18); fx.fill(); fx.restore();
+  }
+  caixas.casaco = { x: x0 - larg * s, y: chao + (yCorpo - 72) * s, w: larg * 2 * s, h: 72 * s, ok: mostraCasaco };
+
+  // braços
+  fx.strokeStyle = mostraCasaco ? COR_CASACO() : pele; fx.lineWidth = 13;
+  const ombro = yCorpo - 58 + respira;
+  fx.beginPath();
+  if (morto) {
+    fx.moveTo(-larg, ombro); fx.lineTo(-larg - 10, ombro + 50); fx.moveTo(larg, ombro); fx.lineTo(larg + 10, ombro + 50);
+  } else if (sente > .35) {
+    fx.moveTo(-larg, ombro); fx.quadraticCurveTo(-larg - 10, ombro + 30, 12, ombro + 32);
+    fx.moveTo(larg, ombro); fx.quadraticCurveTo(larg + 10, ombro + 30, -12, ombro + 28);
+  } else if (calor > .35) {
+    const leque = Math.sin(agora / 90) * .5;
+    fx.moveTo(-larg, ombro); fx.lineTo(-larg - 12, ombro + 55);
+    fx.moveTo(larg, ombro); fx.lineTo(larg + 22, ombro - 25); fx.stroke();
+    fx.save(); fx.translate(larg + 22, ombro - 30); fx.rotate(leque);
+    fx.fillStyle = "#f4e3b5"; fx.beginPath(); fx.moveTo(0, 0); fx.arc(0, 0, 26, -2.4, -.7); fx.closePath(); fx.fill();
+    fx.restore(); fx.beginPath();
+  } else {
+    const aceno = Math.sin(agora / 250) * .4;
+    fx.moveTo(-larg, ombro); fx.lineTo(-larg - 12, ombro + 55);
+    fx.moveTo(larg, ombro); fx.lineTo(larg + 30 * Math.cos(-1.1 + aceno), ombro + 30 * Math.sin(-1.1 + aceno) - 20);
+  }
+  fx.stroke();
+
+  const hy = yCorpo - 100 + respira + murcha * .4;
+  fx.fillStyle = pele; fx.beginPath(); fx.arc(0, hy, 30, 0, 7); fx.fill();
+
+  // cachecol e gorro (só aparecem no frio e se ainda estiverem nele)
+  const alfaItem = clamp((frio - .2) * 3);
+  if (itens.cachecol.on && frio > .2) { fx.save(); fx.globalAlpha = alfaItem; fx.translate(0, hy + 28); desenharCachecol(fx, agora); fx.restore(); }
+  if (itens.gorro.on && frio > .2) { fx.save(); fx.globalAlpha = alfaItem; fx.translate(0, hy - 10); desenharGorro(fx); fx.restore(); }
+  caixas.cachecol = { x: x0 - 30 * s, y: chao + (hy + 18) * s, w: 60 * s, h: 40 * s, ok: itens.cachecol.on && frio > .2 };
+  caixas.gorro = { x: x0 - 34 * s, y: chao + (hy - 48) * s, w: 68 * s, h: 50 * s, ok: itens.gorro.on && frio > .2 };
+
+  // rosto
+  fx.fillStyle = "#1d2433"; fx.strokeStyle = "#1d2433"; fx.lineWidth = 3;
+  if (morto) {                                       // olhos em X
+    [-10, 10].forEach(ex => { fx.beginPath(); fx.moveTo(ex - 5, hy - 7); fx.lineTo(ex + 5, hy + 3); fx.moveTo(ex + 5, hy - 7); fx.lineTo(ex - 5, hy + 3); fx.stroke(); });
+    fx.beginPath(); fx.moveTo(-8, hy + 14); fx.lineTo(8, hy + 14); fx.stroke();
+  } else {
+    if (calor > .4) {
+      fx.beginPath(); fx.roundRect(-22, hy - 8, 19, 11, 4); fx.roundRect(3, hy - 8, 19, 11, 4); fx.fill();
+      fx.beginPath(); fx.moveTo(-3, hy - 4); fx.lineTo(3, hy - 4); fx.stroke();
+    } else if (sente > .5) {
+      fx.beginPath(); fx.moveTo(-15, hy - 3); fx.lineTo(-7, hy); fx.lineTo(-15, hy + 3);
+      fx.moveTo(15, hy - 3); fx.lineTo(7, hy); fx.lineTo(15, hy + 3); fx.stroke();
+    } else {
+      const pisca = (agora % 3500) < 120 ? .2 : 1;
+      fx.beginPath(); fx.ellipse(-10, hy - 2, 3.5, 4.5 * pisca, 0, 0, 7); fx.ellipse(10, hy - 2, 3.5, 4.5 * pisca, 0, 0, 7); fx.fill();
+    }
+    fx.beginPath();
+    if (sente > .5) {
+      const bate = Math.sin(agora / 40) * 1.5;
+      fx.fillStyle = "#fff"; fx.fillRect(-9, hy + 10 + bate, 18, 6); fx.strokeRect(-9, hy + 10 + bate, 18, 6);
+    } else if (calor > .6) {
+      fx.arc(0, hy + 12, 8, 0, Math.PI); fx.fillStyle = "#7a1f2b"; fx.fill();
+      fx.fillStyle = "#ff7b9c"; fx.beginPath(); fx.ellipse(0, hy + 20, 5, 6, 0, 0, 7); fx.fill();
+    } else { fx.arc(0, hy + 6, 10, .2, Math.PI - .2); fx.stroke(); }
+  }
+
+  // bloco de gelo crescendo em volta dele
+  const gelo = morto ? (morte.tipo === "frio" ? ease : 0) : congelando * .5;
+  if (gelo > 0) {
+    fx.fillStyle = `rgba(190,230,255,${.25 + gelo * .35})`; fx.strokeStyle = `rgba(255,255,255,${gelo})`; fx.lineWidth = 3;
+    const alt = 210 * gelo;
+    fx.beginPath(); fx.roundRect(-55, -alt, 110, alt, 8); fx.fill(); fx.stroke();
+    fx.strokeStyle = `rgba(255,255,255,${gelo * .6})`;
+    fx.beginPath(); fx.moveTo(-40, -alt + 20); fx.lineTo(-20, -alt + 60); fx.moveTo(30, -alt + 40); fx.lineTo(42, -alt + 90); fx.stroke();
+  }
+  fx.restore();
+
+  // fantasminha subindo
+  if (morto && agora - morte.inicio > 1200) {
+    const t = (agora - morte.inicio - 1200) / 4000;
+    if (t < 1) {
+      const gx = x0 - 40 * s + Math.sin(t * 12) * 15 * s, gy = chao - (80 + t * 380) * s;
+      fx.save(); fx.globalAlpha = 1 - t; fx.translate(gx, gy); fx.scale(s, s);
+      fx.fillStyle = "rgba(255,255,255,.9)";
+      fx.beginPath(); fx.arc(0, 0, 26, Math.PI, 0); fx.lineTo(26, 34);
+      for (let k = 0; k < 4; k++) fx.quadraticCurveTo(19 - k * 13, 26, 13 - k * 13, 34);
+      fx.closePath(); fx.fill();
+      fx.fillStyle = "#1d2433"; fx.beginPath(); fx.arc(-9, -2, 4, 0, 7); fx.arc(9, -2, 4, 0, 7); fx.fill();
+      fx.restore();
+    }
+  }
+
+  // itens arrancados: arrastados pelo mouse ou caindo até o chão
+  ITENS.forEach(k => {
+    const p = itens[k].solto; if (!p) return;
+    if (!p.arrastando) {
+      p.vy += .6; p.x += p.vx; p.y += p.vy; p.vx *= .97; p.rot += p.vx * .02;
+      if (p.y > chao - 6 * s) { p.y = chao - 6 * s; p.vy *= -.3; p.vx *= .7; }
+    }
+    fx.save(); fx.translate(p.x, p.y); fx.rotate(p.rot); fx.scale(s, s);
+    if (k === "gorro") desenharGorro(fx);
+    else if (k === "cachecol") desenharCachecol(fx, agora);
+    else { fx.translate(0, 36); desenharCasaco(fx, 38); }
+    fx.restore();
+  });
+
+  if (!morto && sente > .3 && quadro % 6 === 0) fumacas.push({ x: x0 + 20 * s, y: chao + (hy + 14) * s, r: 4 * s, a: .5 });
+  if (derreteu && quadro % 8 === 0 && agora - morte.inicio < 6000) fumacas.push({ x: x0 + (Math.random() * 160 - 80) * s, y: chao - 10 * s, r: 6 * s, a: .4 });
+  if (!morto && calor > .3 && Math.random() < calor * .15 + derretendo * .5) gotas.push({ x: x0 + (Math.random() * 50 - 25) * s, y: chao + (hy - 15) * s, v: 0 });
+  for (let i = fumacas.length - 1; i >= 0; i--) {
+    const f = fumacas[i]; f.x += 1.2 * s; f.y -= .5 * s; f.r += .5 * s; f.a -= .008;
+    if (f.a <= 0) { fumacas.splice(i, 1); continue; }
+    fx.fillStyle = `rgba(255,255,255,${f.a})`; fx.beginPath(); fx.arc(f.x, f.y, f.r, 0, 7); fx.fill();
+  }
+  fx.fillStyle = "rgba(140,210,255,.9)";
+  for (let i = gotas.length - 1; i >= 0; i--) {
+    const g = gotas[i]; g.v += .25; g.y += g.v;
+    if (g.y > chao) { gotas.splice(i, 1); continue; }
+    fx.beginPath(); fx.moveTo(g.x, g.y - 6 * s); fx.quadraticCurveTo(g.x + 4 * s, g.y, g.x, g.y + 3 * s);
+    fx.quadraticCurveTo(g.x - 4 * s, g.y, g.x, g.y - 6 * s); fx.fill();
+  }
+}
+
+/* ---------- mouse: arrancar a roupa dele ---------- */
+let segurando = null, ultimoPonto = null;
+const dentro = (b, x, y) => b && b.ok && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
+function itemSob(x, y){ return morte.inicio ? null : ["gorro", "cachecol", "casaco"].find(k => dentro(caixas[k], x, y)); }
+frente.addEventListener("pointerdown", e => {
+  const k = itemSob(e.clientX, e.clientY); if (!k) return;
+  itens[k].on = false;
+  itens[k].solto = { x: e.clientX, y: e.clientY, vx: 0, vy: 0, rot: 0, arrastando: true };
+  segurando = k; ultimoPonto = { x: e.clientX, y: e.clientY };
+  frente.setPointerCapture(e.pointerId);
+});
+frente.addEventListener("pointermove", e => {
+  if (segurando) {
+    const p = itens[segurando].solto;
+    p.vx = e.clientX - ultimoPonto.x; p.vy = e.clientY - ultimoPonto.y;
+    p.x = e.clientX; p.y = e.clientY; ultimoPonto = { x: e.clientX, y: e.clientY };
+  }
+  frente.style.cursor = segurando ? "grabbing" : itemSob(e.clientX, e.clientY) ? "grab" : "default";
+});
+frente.addEventListener("pointerup", () => { if (segurando) { itens[segurando].solto.arrastando = false; segurando = null; } });
+
+function anunciarMorte(){
+  const el = $("#estado"); el.textContent = morte.tipo === "calor" ? "🫠 Ele derreteu de calor!" : "💀 Ele morreu de frio!";
+  el.classList.remove("troca"); void el.offsetWidth; el.classList.add("troca");
+  $("#reviver").hidden = false;
+}
+function reviver(){
+  morte.inicio = null; morte.tipo = null; morte.exposto = 0; morte.aquecendo = 0; vestirTudo();
+  $("#reviver").hidden = true; estadoAnterior = null; atualizar();
+}
+
+let quadro = 0;
+function desenhar(agora){
+  quadro++;
+  // suaviza para a mudança ser gradual, nunca um salto
+  frio += (alvoFrio - frio) * .02;
+  calor += (alvoCalor - calor) * .02;
+  if (tempAlvo !== null) { tempVista = tempVista === null ? tempAlvo : tempVista + (tempAlvo - tempVista) * .08; $("#num").textContent = tempVista.toFixed(1).replace(".", ","); }
+
+  /* céu */
+  const g = cx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, rgb(corCeu(0))); g.addColorStop(.6, rgb(corCeu(1))); g.addColorStop(1, rgb(corCeu(2)));
+  cx.fillStyle = g; cx.fillRect(0, 0, W, H);
+
+  /* sol: cresce e brilha com o calor; some atrás de nuvem no frio */
+  const sx = W * .78, sy = H * mix(.32, .22, calor), sr = mix(40, 110, calor) * (1 - frio * .5);
+  cx.save(); cx.globalAlpha = 1 - frio * .8;
+  const halo = cx.createRadialGradient(sx, sy, sr * .4, sx, sy, sr * mix(2.5, 6, calor));
+  halo.addColorStop(0, `rgba(255,${Math.round(mix(240, 170, calor))},120,${mix(.35, .8, calor)})`);
+  halo.addColorStop(1, "rgba(255,150,60,0)");
+  cx.fillStyle = halo; cx.fillRect(0, 0, W, H);
+  if (calor > .05) {           // raios girando
+    cx.translate(sx, sy); cx.rotate(agora / 6000);
+    cx.fillStyle = `rgba(255,210,120,${calor * .25})`;
+    for (let i = 0; i < 12; i++) { cx.rotate(Math.PI / 6); cx.beginPath(); cx.moveTo(0, -sr * .8); cx.lineTo(sr * .25, -sr * 3.5 * calor - sr); cx.lineTo(-sr * .25, -sr * 3.5 * calor - sr); cx.fill(); }
+    cx.setTransform(1, 0, 0, 1, 0, 0);
+  }
+  cx.beginPath(); cx.arc(sx, sy, sr * (1 + Math.sin(agora / 400) * .03 * calor), 0, 7);
+  cx.fillStyle = `rgb(255,${Math.round(mix(235, 200, calor))},${Math.round(mix(170, 90, calor))})`; cx.fill();
+  cx.restore();
+
+  /* nuvens carregadas no frio */
+  if (frio > .02) {
+    cx.fillStyle = `rgba(230,238,248,${frio * .55})`;
+    for (let i = 0; i < 6; i++) {
+      const x = ((i * 260 + agora / 60) % (W + 400)) - 200, y = H * (.12 + (i % 3) * .07);
+      for (let k = 0; k < 4; k++) { cx.beginPath(); cx.arc(x + k * 55, y + Math.sin(k) * 12, 50 + k * 6, 0, 7); cx.fill(); }
+    }
+  }
+
+  /* montanhas: secas e avermelhadas no calor, com neve no frio */
+  const passo = W / (serra.length - 1);
+  cx.beginPath(); cx.moveTo(0, H);
+  serra.forEach((h, i) => cx.lineTo(i * passo, H * h));
+  cx.lineTo(W, H); cx.closePath();
+  cx.fillStyle = rgb([Math.round(mix(mix(25, 60, frio), 90, calor)), Math.round(mix(mix(55, 80, frio), 40, calor)), Math.round(mix(mix(70, 120, frio), 30, calor))]);
+  cx.fill();
+  if (frio > .05) {
+    cx.save(); cx.clip();
+    cx.fillStyle = `rgba(250,253,255,${frio})`;
+    serra.forEach((h, i) => { cx.beginPath(); cx.arc(i * passo, H * h, passo * .9 * frio + 4, 0, 7); cx.fill(); });
+    cx.fillRect(0, H * .86 + (1 - frio) * 80, W, H);    // chão coberto de neve
+    cx.restore();
+  }
+
+  /* ar tremendo de calor (filtro SVG) */
+  $("#desloc").setAttribute("scale", (calor * 22).toFixed(1));
+  $("#turb").setAttribute("baseFrequency", `0.008 ${(.03 + Math.sin(agora / 700) * .006).toFixed(4)}`);
+
+  /* camada da frente (sem tremor): partículas e geada */
+  fx.clearRect(0, 0, W, H);
+
+  // folhas ao vento: só no clima ameno
+  const ameno = 1 - Math.max(frio, calor);
+  folhas.forEach((p, i) => {
+    p.f += .03; p.g += .05; p.x += p.v; p.y += Math.sin(p.f) * 1.2;
+    if (p.x > W + 20) folhas[i] = novaFolha();
+    fx.save(); fx.globalAlpha = ameno * .8; fx.translate(p.x, p.y); fx.rotate(p.g);
+    fx.fillStyle = "#8fd18a"; fx.beginPath(); fx.ellipse(0, 0, 9, 4, 0, 0, 7); fx.fill(); fx.restore();
+  });
+
+  // neve: quantidade e vento proporcionais ao frio
+  const qtdNeve = Math.round(neve.length * frio), vento = 1 + frio * 2.5;
+  fx.fillStyle = "rgba(255,255,255,.9)";
+  for (let i = 0; i < qtdNeve; i++) {
+    const p = neve[i]; p.f += .02;
+    p.y += p.v * vento; p.x += Math.sin(p.f) * .8 + frio * 1.5;
+    if (p.y > H + 10 || p.x > W + 10) { neve[i] = novaNeve(true); continue; }
+    fx.beginPath(); fx.arc(p.x, p.y, p.t, 0, 7); fx.fill();
+  }
+
+  // brasas subindo: quantidade e velocidade proporcionais ao calor
+  const qtdBrasa = Math.round(brasas.length * calor);
+  fx.save(); fx.shadowColor = "#ff7a2e"; fx.shadowBlur = 10;
+  for (let i = 0; i < qtdBrasa; i++) {
+    const p = brasas[i]; p.f += .08;
+    p.y -= p.v * (1 + calor); p.x += Math.sin(p.f) * 1.1;
+    if (p.y < -10) { brasas[i] = novaBrasa(true); continue; }
+    const a = .5 + .5 * Math.sin(p.f * 3);
+    fx.fillStyle = `rgba(255,${Math.round(120 + 90 * a)},50,${.4 + .6 * a})`;
+    fx.beginPath(); fx.arc(p.x, p.y, p.t, 0, 7); fx.fill();
+  }
+  fx.restore();
+
+  personagem(agora);
+
+  // geada nas bordas da tela
+  if (frio > .02) {
+    const gr = fx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * mix(.75, .3, frio), W / 2, H / 2, Math.max(W, H) * .75);
+    gr.addColorStop(0, "rgba(220,240,255,0)"); gr.addColorStop(1, `rgba(225,242,255,${frio * .85})`);
+    fx.fillStyle = gr; fx.fillRect(0, 0, W, H);
+  }
+  // vermelho pulsando nas bordas no calor extremo
+  if (calor > .5) {
+    const a = (calor - .5) * 2 * (.25 + .2 * Math.sin(agora / 300));
+    const gr = fx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * .35, W / 2, H / 2, Math.max(W, H) * .75);
+    gr.addColorStop(0, "rgba(255,60,30,0)"); gr.addColorStop(1, `rgba(255,60,30,${a})`);
+    fx.fillStyle = gr; fx.fillRect(0, 0, W, H);
+  }
+
+  $(".valor").style.color = rgb([Math.round(mix(mix(255, 200, frio), 255, calor)), Math.round(mix(mix(255, 235, frio), 225, calor)), Math.round(mix(mix(255, 255, frio), 200, calor))]);
+  requestAnimationFrame(desenhar);
+}
+requestAnimationFrame(desenhar);
+
+/* ---------- leitura do sensor ---------- */
+let estadoAnterior = null;
+let modoLocal = null, tLocal = 18;
+const t0 = Date.now();
+function simularLocal(){
+  const alvo = modoLocal === "quente" ? 40 : modoLocal === "frio" ? -6 : 18 + 6 * Math.sin((Date.now() - t0) / 20000);
+  tLocal += (alvo - tLocal) * (modoLocal ? .15 : .25) + (Math.random() - .5) * .6;
+  const h = new Date().toLocaleTimeString("pt-BR");
+  return { ok: true, temp: +tLocal.toFixed(2), simulado: true, min: 2, max: 30, frio: 12, calor: 24, hora: h };
+}
+async function lerApi(){
+  try {
+    const ctrl = new AbortController(); setTimeout(() => ctrl.abort(), 1500);
+    const d = await (await fetch("/api/temp", { signal: ctrl.signal })).json();
+    if (d.ok) return d;
+  } catch (e) {}
+  return simularLocal();               // sem servidor/sensor: o boneco continua vivo
+}
+async function atualizar(){
+  try {
+    const d = await lerApi();
+    if (!d.ok) throw new Error(d.erro);
+    cfg = { min: d.min, max: d.max, frio: d.frio, calor: d.calor };
+    tempAlvo = d.temp;
+    [alvoFrio, alvoCalor] = intensidades(d.temp);
+
+    const estado = d.temp < d.min ? "Congelando! Abaixo de " + d.min + " °C"
+                 : d.temp > d.max ? "Calor extremo! Acima de " + d.max + " °C"
+                 : alvoFrio > .3 ? "Esfriando…"
+                 : alvoCalor > .3 ? "Esquentando…"
+                 : "Temperatura agradável";
+    if (estado !== estadoAnterior && !morte.inicio) {
+      const el = $("#estado"); el.textContent = estado;
+      el.classList.remove("troca"); void el.offsetWidth; el.classList.add("troca");
+      estadoAnterior = estado;
+    }
+    document.body.classList.toggle("alerta", d.temp < d.min || d.temp > d.max);
+    $("#info").textContent = (d.simulado ? "Valor simulado · " : "") + "Atualizado às " + d.hora;
+  } catch (e) {
+    $("#estado").textContent = "Sem conexão com o sensor. Tentando de novo…";
+  }
+}
+atualizar(); setInterval(atualizar, 2000);
+$("#reviver").addEventListener("click", reviver);
+
+document.querySelectorAll(".demo .btn").forEach(b => b.addEventListener("click", async () => {
+  document.querySelectorAll(".demo .btn").forEach(x => x.classList.toggle("ativo", x === b));
+  modoLocal = b.dataset.modo === "normal" ? null : b.dataset.modo;
+  try { await fetch(`/api/demo/${b.dataset.modo}`, { method: "POST" }); } catch (e) {}
+  atualizar();
+}));
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    print("Painel rodando em http://localhost:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False)
