@@ -117,7 +117,8 @@ PAGINA = r"""<!doctype html>
        background:transparent;cursor:pointer;transition:background .3s}
   .btn:hover{background:rgba(255,255,255,.12)}
   .btn:focus-visible{outline:2px solid #fff;outline-offset:2px}
-  .reviver{position:fixed;left:50%;top:calc(9vh + 13rem);transform:translateX(-50%);z-index:4;background:#fff;color:#0d1b2a}
+  .reviver{margin-top:16px;pointer-events:auto;background:#fff;color:#0d1b2a;text-shadow:none}
+  .reviver[hidden]{display:none}
   .reviver:hover{background:#dcefff}
   #frente{z-index:2;touch-action:none}
   .btn.ativo{background:#fff;color:#0d1b2a}
@@ -137,9 +138,9 @@ PAGINA = r"""<!doctype html>
   <div class="valor"><span id="num">--</span><small>°C</small></div>
   <div id="estado">Conectando ao sensor…</div>
   <div class="info" id="info"></div>
+  <button class="btn reviver" id="reviver" hidden>😇 Reviver</button>
 </div>
 
-<button class="btn reviver" id="reviver" hidden>😇 Reviver</button>
 <nav class="demo" aria-label="Modo demonstração">
   <button class="btn" data-modo="frio">❄️ Esfriar</button>
   <button class="btn ativo" data-modo="normal">Sensor real</button>
